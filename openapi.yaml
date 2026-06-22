@@ -1,0 +1,277 @@
+openapi: "3.0.3"
+info:
+  title: Analyzer Bot API
+  description: |
+    XAU/USD Trading Signal Generator — FastAPI backend that powers the Telegram bot
+    and serves REST endpoints for the Next.js dashboard.
+  version: "1.0.0"
+  contact:
+    name: AOT
+    url: https://analyzer-dashboard.vercel.app
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: https://your-bot-api.railway.app
+    description: Production (Railway)
+
+paths:
+  /:
+    get:
+      summary: Root info
+      tags: [Core]
+      responses:
+        "200":
+          description: API metadata and endpoint listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, example: "Analyzer Bot API" }
+                  status: { type: string, example: "running" }
+                  documentation: { type: string, example: "/docs" }
+                  endpoints:
+                    type: object
+                    properties:
+                      signals: { type: string, example: "/api/signal" }
+                      trades: { type: string, example: "/api/trades" }
+                      stats: { type: string, example: "/api/stats" }
+                      health: { type: string, example: "/health" }
+
+  /health:
+    get:
+      summary: Health check
+      tags: [Core]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [healthy] }
+                  timestamp: { type: string, format: date-time }
+                  version: { type: string, example: "1.0.0" }
+
+  /api/signal:
+    post:
+      summary: Generate trading signal
+      tags: [Signals]
+      description: |
+        Runs the 4-timeframe SignalGenerator pipeline (1H/4H trend → 15M S/R → 5M pullback → 1M entry).
+        Saves the generated signal to Firestore.
+      responses:
+        "200":
+          description: Signal generated (may be unsuccessful due to market conditions)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignalResponse"
+
+    get:
+      summary: List signals
+      tags: [Signals]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+          description: Max signals to return
+      responses:
+        "200":
+          description: Array of signals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  signals: { type: array, items: { $ref: "#/components/schemas/Signal" } }
+
+  /api/signal/{signal_id}:
+    get:
+      summary: Get signal by ID
+      tags: [Signals]
+      parameters:
+        - name: signal_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Signal data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Signal"
+        "404":
+          description: Signal not found
+
+  /api/trades:
+    post:
+      summary: Log a completed trade
+      tags: [Trades]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TradeLog"
+      responses:
+        "200":
+          description: Trade logged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradeLogResponse"
+        "500":
+          description: Error logging trade
+
+    get:
+      summary: Get all trades
+      tags: [Trades]
+      responses:
+        "200":
+          description: Array of trades (sorted by timestamp desc)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trades: { type: array, items: { $ref: "#/components/schemas/Trade" } }
+
+  /api/stats:
+    get:
+      summary: Get trading statistics
+      tags: [Trades]
+      responses:
+        "200":
+          description: Calculated trading stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradingStats"
+
+  /api/api-stats:
+    get:
+      summary: Get TradingView API usage stats
+      tags: [Meta]
+      responses:
+        "200":
+          description: API request counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  used: { type: integer }
+                  limit: { type: integer }
+                  remaining: { type: integer }
+
+  /webhook/telegram:
+    post:
+      summary: Telegram webhook endpoint
+      tags: [Telegram]
+      description: Receives Telegram updates. Currently a placeholder.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Acknowledged
+
+components:
+  schemas:
+    CandleData:
+      type: object
+      properties:
+        time: { type: integer, description: "Unix timestamp" }
+        open: { type: number, format: float }
+        high: { type: number, format: float }
+        low: { type: number, format: float }
+        close: { type: number, format: float }
+        volume: { type: number, format: float }
+
+    SignalEntry:
+      type: object
+      properties:
+        price: { type: number, format: float, description: "Entry price" }
+        tp: { type: number, format: float, description: "Take profit price" }
+        tp_pips: { type: integer, description: "TP in pips" }
+        auto_close: { type: boolean, default: false }
+
+    Signal:
+      type: object
+      properties:
+        id: { type: string, example: "signal_20250101_120000" }
+        timestamp: { type: string, format: date-time }
+        trend: { type: string, enum: [UP, DOWN, NEUTRAL] }
+        entries: { type: array, items: { $ref: "#/components/schemas/SignalEntry" } }
+        support_level: { type: number, format: float }
+        resistance_level: { type: number, format: float }
+        pullback_detected: { type: boolean }
+        entry_confirmation: { type: boolean }
+        valid_until: { type: string, format: date-time }
+        confidence: { type: number, format: float, minimum: 0, maximum: 1 }
+
+    SignalResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        signal: { $ref: "#/components/schemas/Signal", nullable: true }
+        message: { type: string }
+
+    TradeLog:
+      type: object
+      properties:
+        entry_price: { type: number, format: float }
+        exit_price: { type: number, format: float }
+        quantity: { type: number, format: float, default: 0.01 }
+        result: { type: string, enum: [win, loss, pending] }
+        signal_id: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        hold_time_seconds: { type: integer, nullable: true }
+
+    TradeLogResponse:
+      type: object
+      properties:
+        id: { type: string }
+        entry_price: { type: number, format: float }
+        exit_price: { type: number, format: float }
+        pnl: { type: number, format: float }
+        pnl_percent: { type: number, format: float }
+        result: { type: string, enum: [win, loss, pending] }
+        timestamp: { type: string, format: date-time }
+        message: { type: string }
+
+    Trade:
+      type: object
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        entry_price: { type: number, format: float }
+        exit_price: { type: number, format: float }
+        quantity: { type: number, format: float }
+        pnl: { type: number, format: float }
+        pnl_percent: { type: number, format: float }
+        result: { type: string, enum: [win, loss] }
+        signal_id: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        hold_time_seconds: { type: integer, nullable: true }
+
+    TradingStats:
+      type: object
+      properties:
+        total_trades: { type: integer }
+        wins: { type: integer }
+        losses: { type: integer }
+        win_rate: { type: number, format: float, minimum: 0, maximum: 1 }
+        total_pnl: { type: number, format: float }
+        profit_factor: { type: number, format: float }
+        avg_win: { type: number, format: float }
+        avg_loss: { type: number, format: float }
+        consecutive_wins: { type: integer }
+        consecutive_losses: { type: integer }
