@@ -167,7 +167,7 @@ class TelegramBotHandler:
     async def dashboard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /dashboard — send inline button linking to the web dashboard."""
         try:
-            dashboard_url = "https://analyzer-dashboard.vercel.app"
+            dashboard_url = "https://analyzer-dashboard-kohl.vercel.app"
 
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 Open Dashboard", url=dashboard_url)]
