@@ -5,20 +5,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from telegram.ext import Application
-from config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_DIR
-from telegram.commands import register_commands
+from config import Config
+from telegram_bot.commands import register_commands
 from firestore.client import firestore_client
 from routers.trades import router as trades_router
 from routers.signals import router as signals_router
 from routers.telegram import router as telegram_router
 from routers.admin import router as admin_router
 
-os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(Config.LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
+    level=getattr(logging, Config.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'{LOG_DIR}/bot.log'),
+        logging.FileHandler(f'{Config.LOG_DIR}/bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting AOT Analyzer Bot (FastAPI + Telegram)")
     logger.info("=" * 50)
 
-    if not TELEGRAM_BOT_TOKEN:
+    if not Config.TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled")
     else:
         try:
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Firebase connection: {str(e)} — continuing without Firestore")
 
-        bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        bot_app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
         register_commands(bot_app)
         await bot_app.initialize()
         await bot_app.start()
