@@ -53,6 +53,7 @@ class Config:
     BOT_ENV = os.getenv('BOT_ENV', 'development')
     DEBUG = os.getenv('DEBUG', 'False') == 'True'
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    LOG_DIR = os.getenv('LOG_DIR', './logs')
 
     TRADING_PAIR = 'FOREXCOM:XAUUSD'
     SIGNAL_VALIDITY_HOURS = 3

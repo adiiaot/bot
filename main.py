@@ -1,112 +1,85 @@
-import asyncio
 import logging
+import asyncio
 import os
-import threading
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from datetime import datetime
-from app.telegram_handler import TelegramBotHandler
-from routers import signals, trades, telegram as telegram_router
-from config import Config
-from utils.logger import setup_logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from telegram.ext import Application
+from config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_DIR
+from telegram.commands import register_commands
+from firestore.client import firestore_client
+from routers.trades import router as trades_router
+from routers.signals import router as signals_router
+from routers.telegram import router as telegram_router
+from routers.admin import router as admin_router
 
-setup_logging()
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'{LOG_DIR}/bot.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
+bot_app: Application | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start Telegram bot polling when FastAPI starts, stop on shutdown."""
+    global bot_app
+    logger.info("=" * 50)
+    logger.info("Starting AOT Analyzer Bot (FastAPI + Telegram)")
+    logger.info("=" * 50)
+
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled")
+    else:
+        try:
+            _ = firestore_client
+            logger.info("Firebase Firestore connected")
+        except Exception as e:
+            logger.warning(f"Firebase connection: {str(e)} — continuing without Firestore")
+
+        bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        register_commands(bot_app)
+        await bot_app.initialize()
+        await bot_app.start()
+        await bot_app.updater.start_polling(allowed_updates=['message', 'callback_query'])
+        logger.info("Telegram bot polling started")
+
+    yield
+
+    if bot_app:
+        logger.info("Shutting down Telegram bot...")
+        await bot_app.updater.stop()
+        await bot_app.stop()
+        logger.info("Bot stopped.")
+
+
 app = FastAPI(
-    title="Analyzer Bot API",
-    description="XAU/USD Trading Signal Generator",
-    version="1.0.0"
+    title="AOT Analyzer Bot API",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-bot_handler = TelegramBotHandler()
-_telegram_thread = None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-def run_telegram_bot():
-    """Run Telegram bot polling in a separate thread."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(bot_handler.start_bot())
-    except Exception as e:
-        logger.error(f"Telegram bot stopped: {e}")
-
-
-@app.on_event("startup")
-async def startup():
-    global _telegram_thread
-    logger.info("Analyzer Bot API starting up...")
-    logger.info(f"Environment: {Config.BOT_ENV}")
-    logger.info(f"Debug mode: {Config.DEBUG}")
-
-    if not Config.TELEGRAM_BOT_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled")
-        return
-
-    _telegram_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    _telegram_thread.start()
-    logger.info("Telegram bot polling started in background thread")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    logger.info("Analyzer Bot API shutting down...")
+app.include_router(trades_router)
+app.include_router(signals_router)
+app.include_router(telegram_router)
+app.include_router(admin_router)
 
 
 @app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0.0"
-    }
-
-
-app.include_router(signals.router, prefix="/api", tags=["signals"])
-app.include_router(trades.router, prefix="/api", tags=["trades"])
-app.include_router(telegram_router.router, prefix="/webhook")
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.detail}
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error"}
-    )
-
-
-@app.get("/")
-async def root():
-    return {
-        "name": "Analyzer Bot API",
-        "status": "running",
-        "documentation": "/docs",
-        "endpoints": {
-            "signals": "/api/signal",
-            "trades": "/api/trades",
-            "stats": "/api/stats",
-            "health": "/health"
-        }
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=Config.DEBUG,
-        log_level=Config.LOG_LEVEL.lower()
-    )
+async def health():
+    return {"status": "ok", "bot": bot_app is not None}
