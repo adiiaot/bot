@@ -12,6 +12,7 @@ from routers.trades import router as trades_router
 from routers.signals import router as signals_router
 from routers.telegram import router as telegram_router
 from routers.admin import router as admin_router
+from routers.price import router as price_router
 
 os.makedirs(Config.LOG_DIR, exist_ok=True)
 logging.basicConfig(
@@ -78,6 +79,7 @@ app.include_router(trades_router)
 app.include_router(signals_router)
 app.include_router(telegram_router)
 app.include_router(admin_router)
+app.include_router(price_router)
 
 
 @app.get("/health")
