@@ -37,7 +37,7 @@ class NvidiaVisionAnalyzer:
         cache_key = self._generate_cache_key(image_base64)
         if cache_key in self.cache:
             cached_result, cached_time = self.cache[cache_key]
-            if (datetime.utcnow() - cached_time).seconds < self.cache_ttl:
+            if (datetime.utcnow() - cached_time).total_seconds() < self.cache_ttl:
                 logger.debug(f"Using cached vision analysis for {cache_key}")
                 return cached_result
 
@@ -147,7 +147,7 @@ Be precise with price levels. Return ONLY valid JSON, no other text."""
         now = datetime.utcnow()
         expired = [
             k for k, (_, t) in self.cache.items()
-            if (now - t).seconds > self.cache_ttl
+            if (now - t).total_seconds() > self.cache_ttl
         ]
         for k in expired:
             del self.cache[k]

@@ -63,6 +63,8 @@ class Config:
     TRADINGVIEW_REQUESTS_LIMIT = 150
     TRADINGVIEW_REQUESTS_PER_DAY = 5
 
+    DASHBOARD_URL = os.getenv('DASHBOARD_URL', 'https://analyzer-dashboard-kohl.vercel.app')
+
     NVIDIA_MODEL_PROCESSOR = os.getenv('NVIDIA_MODEL_PROCESSOR', 'meta/llama-3.1-8b-instruct')
     NVIDIA_MODEL_VISION = os.getenv('NVIDIA_MODEL_VISION', 'meta/llama-3.2-11b-vision-instruct')
     NVIDIA_MODEL_STRATEGIST = os.getenv('NVIDIA_MODEL_STRATEGIST', 'meta/llama-3.3-70b-instruct')

@@ -12,7 +12,7 @@ class TradesDB:
 
     async def save_trade(self, trade_data: dict) -> str:
         try:
-            trade_id = trade_data.get('id', f"trade_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}")
+            trade_id = trade_data.get('id') or trade_data.get('tradeId') or f"trade_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
             trade_data['timestamp'] = datetime.utcnow()
             self.db.collection(self.collection_name).document(trade_id).set(trade_data)
             logger.info(f"Trade {trade_id} saved")

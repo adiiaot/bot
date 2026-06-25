@@ -30,6 +30,7 @@ class CandleData(BaseModel):
 
 class SignalEntry(BaseModel):
     """One entry leg of a trading signal with take-profit target."""
+    entry_number: int = Field(default=1, description="Entry position number (1-4)")
     price: float = Field(..., description="Entry price")
     tp: float = Field(..., description="Take profit price")
     tp_pips: int = Field(..., description="TP in pips")

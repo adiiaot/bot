@@ -37,7 +37,7 @@ class TradingViewClient:
             return None
 
         try:
-            url = f"{self.base_url}/api/candlesticks/{self.symbol}"
+            url = f"{self.base_url}/api/price/{self.symbol}"
             params = {'timeframe': timeframe, 'range': limit}
             headers = {
                 'x-rapidapi-host': self.api_host,
@@ -49,8 +49,9 @@ class TradingViewClient:
                     if response.status == 200:
                         data = await response.json()
                         self.request_count += 1
-                        logger.info(f"Fetched {len(data.get('bars', []))} candles for {self.symbol} {timeframe}")
-                        return self._parse_candles(data)
+                        bars = data.get('data', {}).get('history', [])
+                        logger.info(f"Fetched {len(bars)} candles for {self.symbol} {timeframe}")
+                        return self._parse_candles(bars)
                     else:
                         logger.error(f"TradingView API error: {response.status}")
                         return None
@@ -59,19 +60,21 @@ class TradingViewClient:
             logger.error(f"Error fetching candles: {str(e)}")
             return None
 
-    def _parse_candles(self, data: dict) -> List[CandleData]:
-        """Parse TradingView API response into CandleData objects."""
-        candles = []
-        bars = data.get('bars', [])
+    def _parse_candles(self, bars: list) -> List[CandleData]:
+        """Parse TradingView API price history into CandleData objects.
 
+        The /api/price endpoint returns history with fields:
+        time, open, close, max (high), min (low), volume.
+        """
+        candles = []
         for bar in bars:
             candle = CandleData(
                 time=bar.get('time'),
                 open=float(bar.get('open', 0)),
-                high=float(bar.get('high', 0)),
-                low=float(bar.get('low', 0)),
+                high=float(bar.get('max', 0)),
+                low=float(bar.get('min', 0)),
                 close=float(bar.get('close', 0)),
-                volume=float(bar.get('volume', 0))
+                volume=float(bar.get('volume', 0) or 0)
             )
             candles.append(candle)
 

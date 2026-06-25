@@ -298,6 +298,7 @@ class SignalGenerator:
             tp = entry_price + (tp_pips * self.pips_value)
 
             signal_entry = SignalEntry(
+                entry_number=idx + 1,
                 price=round(entry, 2),
                 tp=round(tp, 2),
                 tp_pips=tp_pips,

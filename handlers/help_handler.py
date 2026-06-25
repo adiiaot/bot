@@ -10,24 +10,34 @@ class HelpHandler:
         help_text = """
 <b>🤖 AOT Analyzer Bot Commands</b>
 
-<b>/signal</b> — Generate a new trading signal
-Analyzes XAU/USD using Mr PFX strategy
-Returns entry prices, TP levels, confidence score
+<b>/signal</b> — Generate a new XAU/USD trading signal
+Uses Mr PFX 4-timeframe strategy
+Returns entry prices, TP levels, confidence
+
+<b>/log_trade</b> — Log a completed trade
+Step-by-step: entry price → exit price → result
+Saves to Firestore, viewable on Dashboard
 
 <b>/journal</b> — Add trading journal entry
-Log your thoughts and observations
-Synced to Dashboard
+Free-form text notes synced to Dashboard
 
 <b>/stats</b> — View trading statistics
-Shows total signals and latest signals
+Shows total trades, win rate, P&L, streaks
+
+<b>/dashboard</b> — Open web dashboard
+Inline button linking to live analytics
+
+<b>/clear</b> — Clear chat history
+Resets the conversation
 
 <b>/help</b> — Show this help message
 
 <b>ℹ️ How It Works:</b>
-1. Use <code>/signal</code> to generate a signal
-2. Take the trade manually on MT5
-3. Log your thoughts with <code>/journal</code>
-4. Check Dashboard for performance
+1. <code>/signal</code> → get entry levels
+2. Take the trade on MT5
+3. <code>/log_trade</code> → record entry/exit/result
+4. <code>/dashboard</code> → view performance
+5. <code>/journal</code> → log your thoughts
 
 <b>⚠️ Demo mode — no real money at risk.</b>
         """

@@ -85,25 +85,26 @@ class FirebaseManager:
             return False
         try:
             self.db.collection('signals').document(signal.id).set({
-                'id': signal.id,
+                'signalId': signal.id,
                 'timestamp': signal.timestamp,
                 'trend': signal.trend.value,
                 'entries': [
                     {
+                        'entryNumber': entry.entry_number,
                         'price': entry.price,
                         'tp': entry.tp,
-                        'tp_pips': entry.tp_pips,
-                        'auto_close': entry.auto_close
+                        'tpPips': entry.tp_pips,
+                        'autoClose': entry.auto_close
                     }
                     for entry in signal.entries
                 ],
-                'support_level': signal.support_level,
-                'resistance_level': signal.resistance_level,
-                'pullback_detected': signal.pullback_detected,
-                'entry_confirmation': signal.entry_confirmation,
-                'valid_until': signal.valid_until,
+                'supportLevel': signal.support_level,
+                'resistanceLevel': signal.resistance_level,
+                'pullbackDetected': signal.pullback_detected,
+                'entryConfirmation': signal.entry_confirmation,
+                'validUntil': signal.valid_until,
                 'confidence': signal.confidence,
-                'executed': False
+                'status': 'active'
             })
             logger.info(f"Signal {signal.id} saved to Firestore")
             return True
@@ -121,31 +122,39 @@ class FirebaseManager:
             logger.error(f"Error retrieving signal: {str(e)}")
             return None
 
-    async def log_trade(self, trade: TradeLog, signal_id: Optional[str] = None) -> Dict:
+    async def log_trade(self, trade: TradeLog, signal_id: Optional[str] = None, direction: str = "LONG") -> Dict:
         if not self._ensure_initialized():
             return {}
         try:
             trade_id = f"trade_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
 
-            if trade.result == ResultEnum.WIN:
-                pnl = trade.exit_price - trade.entry_price
-            else:
-                pnl = trade.exit_price - trade.entry_price
+            raw_pnl = trade.exit_price - trade.entry_price
+            if direction.upper() == "SHORT":
+                raw_pnl = -raw_pnl
+            pnl = raw_pnl
 
             pnl_percent = (pnl / trade.entry_price) * 100 if trade.entry_price else 0
 
             trade_data = {
-                'id': trade_id,
+                'tradeId': trade_id,
                 'timestamp': datetime.utcnow(),
-                'entry_price': trade.entry_price,
-                'exit_price': trade.exit_price,
-                'quantity': trade.quantity,
+                'entryPrice': trade.entry_price,
+                'exitPrice': trade.exit_price,
+                'entrySize': trade.quantity,
                 'pnl': round(pnl, 2),
-                'pnl_percent': round(pnl_percent, 2),
+                'pnlPercent': round(pnl_percent, 2),
                 'result': trade.result.value,
-                'signal_id': signal_id,
-                'notes': trade.notes,
-                'hold_time_seconds': trade.hold_time_seconds
+                'signalId': signal_id,
+                'status': 'closed',
+                'trend': 'UP',
+                'supportLevel': 0,
+                'resistanceLevel': 0,
+                'stopLoss': 0,
+                'takeProfit': 0,
+                'riskRewardRatio': 0,
+                'journalNotes': trade.notes or '',
+                'tradingConditions': '',
+                'holdTimeSeconds': trade.hold_time_seconds
             }
 
             self.db.collection('trades').document(trade_id).set(trade_data)

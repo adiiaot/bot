@@ -38,7 +38,7 @@ class JournalDB:
         try:
             from firebase_admin import firestore as fs
             query = (self.db.collection(self.collection_name)
-                     .where('userId', '==', user_id)
+                     .where(filter=('userId', '==', user_id))
                      .order_by('timestamp', direction=fs.Query.DESCENDING)
                      .limit(limit))
             docs = query.stream()
