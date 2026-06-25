@@ -24,8 +24,8 @@ def _get_service_account_path() -> Optional[str]:
         return explicit
 
     search_paths = [
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'aot-analyzer-bot-firebase-adminsdk-fbsvc-96f7cb0ea5.json'),
-        os.path.join(os.path.dirname(__file__), '..', '..', 'aot-analyzer-bot-firebase-adminsdk-fbsvc-96f7cb0ea5.json'),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'aot-analyzer-bot-firebase-adminsdk-fbsvc-6ddb184d0e.json'),
+        os.path.join(os.path.dirname(__file__), '..', '..', 'aot-analyzer-bot-firebase-adminsdk-fbsvc-6ddb184d0e.json'),
     ]
     for p in search_paths:
         normalized = os.path.normpath(p)
