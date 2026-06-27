@@ -7,7 +7,8 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
-YAHOO_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X'
+YAHOO_SYMBOLS = ['GC=F', 'XAUUSD=X']
+YAHOO_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart'
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
 TIMEFRAME_MAP = {
@@ -71,7 +72,6 @@ def _parse_yahoo_candles(data: dict, timeframe: str) -> Optional[List[CandleData
     if timeframe in AGGREGATE_TFS:
         candles = _aggregate_candles(candles, 4)
 
-    logger.info(f"Yahoo Finance: {len(candles)} candles for {timeframe}")
     return candles
 
 
@@ -93,9 +93,9 @@ def _parse_rapidapi_candles(bars: list) -> List[CandleData]:
 
 
 class TradingViewClient:
-    """XAU/USD price client with Yahoo Finance (primary) + RapidAPI (fallback).
+    """XAU/USD price client with Yahoo Finance (GC=F + XAUUSD=X) + RapidAPI (fallback).
 
-    No simulated data — returns None if both sources are unreachable.
+    No simulated data — returns None if all sources are unreachable.
     """
 
     def __init__(self):
@@ -106,27 +106,29 @@ class TradingViewClient:
         self.request_count = 0
         self.last_error: Optional[str] = None
 
-    async def _fetch_yahoo(self, timeframe: str) -> Optional[List[CandleData]]:
+    async def _fetch_yahoo(self, timeframe: str, symbol: str) -> Optional[List[CandleData]]:
         interval = TIMEFRAME_MAP.get(timeframe, '60m')
         rng = RANGE_MAP.get(timeframe, '1mo')
-        url = f'{YAHOO_URL}?interval={interval}&range={rng}'
+        url = f'{YAHOO_BASE}/{symbol}?interval={interval}&range={rng}'
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     url, headers={'User-Agent': USER_AGENT},
-                    timeout=aiohttp.ClientTimeout(total=8),
+                    timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
                     if resp.status != 200:
-                        self.last_error = f'Yahoo HTTP {resp.status}'
-                        logger.warning(f'Yahoo returned {resp.status}')
+                        self.last_error = f'Yahoo {symbol} HTTP {resp.status}'
                         return None
                     data = await resp.json()
                     self.request_count += 1
-                    return _parse_yahoo_candles(data, timeframe)
+                    candles = _parse_yahoo_candles(data, timeframe)
+                    if candles:
+                        logger.info(f'Yahoo {symbol}: {len(candles)} candles for {timeframe}')
+                        return candles
+                    return None
         except Exception as e:
-            self.last_error = f'Yahoo error: {e}'
-            logger.warning(f'Yahoo Finance unreachable: {e}')
+            self.last_error = f'Yahoo {symbol} error: {e}'
             return None
 
     async def _fetch_rapidapi(self, timeframe: str, limit: int) -> Optional[List[CandleData]]:
@@ -141,7 +143,7 @@ class TradingViewClient:
                 async with session.get(
                     url, params=params,
                     headers={'x-rapidapi-host': self._rapidapi_host, 'x-rapidapi-key': self._rapidapi_key},
-                    timeout=aiohttp.ClientTimeout(total=5),
+                    timeout=aiohttp.ClientTimeout(total=4),
                 ) as resp:
                     if resp.status != 200:
                         self.last_error = f'RapidAPI HTTP {resp.status}'
@@ -162,16 +164,16 @@ class TradingViewClient:
             return None
 
     async def get_candles(self, timeframe: str, limit: int) -> Optional[List[CandleData]]:
-        candles = await self._fetch_yahoo(timeframe)
-
-        if candles is not None:
-            return candles[-limit:] if len(candles) > limit else candles
+        for sym in YAHOO_SYMBOLS:
+            candles = await self._fetch_yahoo(timeframe, sym)
+            if candles is not None:
+                return candles[-limit:] if len(candles) > limit else candles
 
         candles = await self._fetch_rapidapi(timeframe, limit)
         if candles is not None:
             return candles[-limit:] if len(candles) > limit else candles
 
-        logger.error(f'All data sources failed for {timeframe} — no price data available')
+        logger.error(f'All data sources failed for {timeframe}')
         return None
 
     async def get_current_price(self) -> Optional[float]:
