@@ -4,7 +4,7 @@ XAU/USD trading signal generator powered by TradingView data and Nvidia Vision A
 
 ## Overview
 
-Implements a **4-timeframe Mr PFX framework** that scans XAU/USD across 1H/4H (trend), 15M (levels), 5M (pullback), and 1M (entry) to generate structured trading signals with 4 stacked entry legs and take-profit targets.
+Implements a **4-timeframe framework** that scans XAU/USD across 1H/4H (trend), 15M (levels), 5M (pullback), and 1M (entry) to generate structured trading signals with 4 stacked entry legs and take-profit targets.
 
 ### Signal Pipeline
 

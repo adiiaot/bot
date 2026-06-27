@@ -18,12 +18,12 @@ COMPONENTS = ['rejection', 'internal_region', 'structure', 'sr_bias', 'breakout'
 
 
 class SignalGenerator:
-    """Core signal generation engine implementing the 4-timeframe Mr PFX framework.
+    """Core signal generation engine implementing the 4-timeframe scoring framework.
 
     Pipeline:
         1. 1H/4H — Trend determination via swing point HH/HL/LH/LL detection
         2. 15M  — Support/Resistance level identification via clustered swing points
-        3. 15M  — Mr. PFX 6-component scoring (hard gate: >= 0.55)
+        3. 15M  — 6-component scoring (hard gate: >= 0.55)
         4. 5M   — ATR-based pullback detection (hard gate)
         5. 1M   — Entry confirmation via reversal / structure break / momentum (hard gate)
     """
@@ -176,9 +176,9 @@ class SignalGenerator:
             logger.error(f"Error finding levels: {e}")
             return None, None
 
-    # ─── Mr. PFX Component Scoring ──────────────────────────────────────────
+    # ─── Component Scoring ──────────────────────────────────────────
 
-    async def _score_mrpfx_components(
+    async def _score_components(
         self, df_15m: pd.DataFrame, df_1h: pd.DataFrame,
         trend: TrendEnum, support: float, resistance: float
     ) -> Dict[str, float]:
@@ -572,14 +572,14 @@ class SignalGenerator:
             if not support or not resistance:
                 return None, "No valid S/R levels found on 15M. No signal."
 
-            # Stage 3 — Mr. PFX Scoring
-            component_scores = await self._score_mrpfx_components(df_15m, df_1h, trend, support, resistance)
+            # Stage 3 — Component Scoring
+            component_scores = await self._score_components(df_15m, df_1h, trend, support, resistance)
             weighted_score = self._calculate_weighted_score(component_scores)
             score_str = " | ".join(f"{k}={v:.2f}" for k, v in component_scores.items())
-            logger.info(f"[MRPFX] {score_str}")
-            logger.info(f"[MRPFX] Weighted score: {weighted_score:.2f} (threshold: {SIGNAL_THRESHOLD}) {'✓' if weighted_score >= SIGNAL_THRESHOLD else '✗'}")
+            logger.info(f"[SCORE] {score_str}")
+            logger.info(f"[SCORE] Weighted score: {weighted_score:.2f} (threshold: {SIGNAL_THRESHOLD}) {'✓' if weighted_score >= SIGNAL_THRESHOLD else '✗'}")
             if weighted_score < SIGNAL_THRESHOLD:
-                return None, f"Mr. PFX score {weighted_score:.2f} below threshold ({SIGNAL_THRESHOLD}). No signal."
+                return None, f"Component score {weighted_score:.2f} below threshold ({SIGNAL_THRESHOLD}). No signal."
 
             # Stage 4 — Pullback
             pullback_detected, atr_5m = await self._detect_pullback(df_5m, support, resistance, trend)

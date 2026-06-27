@@ -11,7 +11,7 @@ class HelpHandler:
 <b>🤖 AOT Analyzer Bot Commands</b>
 
 <b>/signal</b> — Generate a new XAU/USD trading signal
-Uses Mr PFX 4-timeframe strategy
+Uses 4-timeframe scalping strategy
 Returns entry prices, TP levels, confidence
 
 <b>/log_trade</b> — Log a completed trade
