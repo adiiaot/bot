@@ -1,5 +1,6 @@
 import logging
-from typing import List, Tuple, Optional
+import math
+from typing import List, Tuple, Optional, Dict
 from datetime import datetime, timedelta
 import pandas as pd
 from app.models import Signal, SignalEntry, TrendEnum, CandleData
@@ -8,339 +9,516 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+PIP_VALUE = 0.10
+SWING_LOOKBACK = 2
+LEVELS_LOOKBACK = 3
+SIGNAL_THRESHOLD = 0.55
+WEIGHTS = [0.20, 0.15, 0.20, 0.20, 0.10, 0.15]
+COMPONENTS = ['rejection', 'internal_region', 'structure', 'sr_bias', 'breakout', 'bob']
+
 
 class SignalGenerator:
     """Core signal generation engine implementing the 4-timeframe Mr PFX framework.
 
     Pipeline:
-        1. 1H/4H — Trend determination via higher highs/lows detection
-        2. 15M  — Support/Resistance level identification via swing points
-        3. 5M   — Pullback detection with percentage-based zone
-        4. 1M   — Entry confirmation via reversal candle patterns
+        1. 1H/4H — Trend determination via swing point HH/HL/LH/LL detection
+        2. 15M  — Support/Resistance level identification via clustered swing points
+        3. 15M  — Mr. PFX 6-component scoring (hard gate: >= 0.55)
+        4. 5M   — ATR-based pullback detection (hard gate)
+        5. 1M   — Entry confirmation via reversal / structure break / momentum (hard gate)
     """
 
     def __init__(self, tv_client: TradingViewClient):
         self.tv_client = tv_client
         self.symbol = Config.TRADING_PAIR
 
-    async def generate_signal(self) -> Tuple[Optional[Signal], str]:
-        """Main entry point. Runs all 4 analysis levels and returns a Signal or error."""
+    # ─── Swing Point Detection ───────────────────────────────────────────────
+
+    def _find_swing_highs(self, df: pd.DataFrame, n: int = SWING_LOOKBACK) -> List[int]:
+        indices = []
+        for i in range(n, len(df) - n):
+            left = all(df['high'].iloc[i] > df['high'].iloc[i - j] for j in range(1, n + 1))
+            right = all(df['high'].iloc[i] > df['high'].iloc[i + j] for j in range(1, n + 1))
+            if left and right:
+                indices.append(i)
+        return indices
+
+    def _find_swing_lows(self, df: pd.DataFrame, n: int = SWING_LOOKBACK) -> List[int]:
+        indices = []
+        for i in range(n, len(df) - n):
+            left = all(df['low'].iloc[i] < df['low'].iloc[i - j] for j in range(1, n + 1))
+            right = all(df['low'].iloc[i] < df['low'].iloc[i + j] for j in range(1, n + 1))
+            if left and right:
+                indices.append(i)
+        return indices
+
+    # ─── ATR Calculation ─────────────────────────────────────────────────────
+
+    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
+        high_low = df['high'] - df['low']
+        high_close = abs(df['high'] - df['close'].shift(1))
+        low_close = abs(df['low'] - df['close'].shift(1))
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = true_range.rolling(period, min_periods=period).mean()
+        if pd.isna(atr.iloc[-1]):
+            return true_range.tail(period).mean() if len(true_range) >= period else true_range.mean()
+        return atr.iloc[-1]
+
+    # ─── Trend & Structure Analysis ──────────────────────────────────────────
+
+    async def _analyze_trend(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> Tuple[TrendEnum, float]:
         try:
-            trend, trend_confidence = await self._analyze_trend()
-            if trend == TrendEnum.NEUTRAL:
-                return None, "Trend not clearly identified. No signal."
+            sh_1h = self._find_swing_highs(df_1h)
+            sl_1h = self._find_swing_lows(df_1h)
+            sh_4h = self._find_swing_highs(df_4h)
+            sl_4h = self._find_swing_lows(df_4h)
 
-            logger.info(f"Trend identified: {trend} (confidence: {trend_confidence:.2f})")
-
-            support, resistance = await self._find_levels()
-            if not support or not resistance:
-                return None, "Support/Resistance levels not found. No signal."
-
-            logger.info(f"Levels found - Support: {support:.2f}, Resistance: {resistance:.2f}")
-
-            entry_price, entry_confirmation = await self._confirm_entry(support, resistance, trend)
-            if not entry_confirmation:
-                return None, "Entry confirmation not found on 1M. No signal."
-
-            logger.info(f"Entry confirmed at: {entry_price:.2f}")
-
-            pullback_detected = await self._detect_pullback(support, resistance, trend)
-            logger.info(f"Pullback: {pullback_detected}")
-
-            signal = self._build_signal(
-                trend=trend,
-                entry_price=entry_price,
-                support=support,
-                resistance=resistance
-            )
-
-            logger.info(f"Signal generated: {signal.id}")
-            return signal, "Signal generated successfully"
-
-        except Exception as e:
-            logger.error(f"Error generating signal: {str(e)}")
-            return None, f"Error: {str(e)}"
-
-    async def _analyze_trend(self) -> Tuple[TrendEnum, float]:
-        """Level 1: Determine trend from 1H and 4H candles.
-
-        Checks both timeframes for direction agreement. Falls back to single
-        timeframe if one is stronger.
-        """
-        try:
-            candles_1h = await self.tv_client.get_candles('1h', 14)
-            candles_4h = await self.tv_client.get_candles('4h', 10)
-
-            if not candles_1h or not candles_4h:
+            def classify(swing_highs, swing_lows):
+                if len(swing_highs) < 2 or len(swing_lows) < 2:
+                    return TrendEnum.NEUTRAL, 0.0
+                sh_prices = [df_1h['high'].iloc[i] for i in swing_highs[-3:]]
+                sl_prices = [df_1h['low'].iloc[i] for i in swing_lows[-3:]]
+                if len(sh_prices) >= 2 and sh_prices[-1] > sh_prices[-2] and \
+                   len(sl_prices) >= 2 and sl_prices[-1] > sl_prices[-2]:
+                    swings = min(len(swing_highs), len(swing_lows))
+                    score = 1.0 if swings >= 4 else (0.80 if swings >= 2 else 0.0)
+                    return TrendEnum.UP, score
+                if len(sh_prices) >= 2 and sh_prices[-1] < sh_prices[-2] and \
+                   len(sl_prices) >= 2 and sl_prices[-1] < sl_prices[-2]:
+                    swings = min(len(swing_highs), len(swing_lows))
+                    score = 1.0 if swings >= 4 else (0.80 if swings >= 2 else 0.0)
+                    return TrendEnum.DOWN, score
                 return TrendEnum.NEUTRAL, 0.0
 
-            df_1h = pd.DataFrame([c.model_dump() for c in candles_1h])
-            trend_1h, score_1h = self._detect_trend_direction(df_1h)
+            trend_1h, score_1h = classify(sh_1h, sl_1h)
+            trend_4h, score_4h = classify(sh_4h, sl_4h)
 
-            df_4h = pd.DataFrame([c.model_dump() for c in candles_4h])
-            trend_4h, score_4h = self._detect_trend_direction(df_4h)
-
-            logger.debug(f"Trend 1H: {trend_1h} ({score_1h:.2f})  4H: {trend_4h} ({score_4h:.2f})")
+            logger.info(f"[TREND] 1H: {trend_1h} ({len(sh_1h)} SH, {len(sl_1h)} SL) | "
+                       f"4H: {trend_4h} ({len(sh_4h)} SH, {len(sl_4h)} SL)")
 
             if trend_1h == trend_4h and trend_1h != TrendEnum.NEUTRAL:
                 confidence = max(score_1h, score_4h)
-                logger.info(f"Trend confirmed: {trend_1h} (confidence: {confidence:.2f})")
+                logger.info(f"[TREND] Both agree → {trend_1h} (confidence: {confidence:.2f})")
                 return trend_1h, confidence
 
-            # Single-timeframe fallback: use the stronger confirmation
+            best_trend = TrendEnum.NEUTRAL
+            best_score = 0.0
             if score_1h > 0.4 and trend_1h != TrendEnum.NEUTRAL:
-                logger.info(f"Using 1H trend: {trend_1h} ({score_1h:.2f})")
-                return trend_1h, score_1h * 0.85
-            if score_4h > 0.4 and trend_4h != TrendEnum.NEUTRAL:
-                logger.info(f"Using 4H trend: {trend_4h} ({score_4h:.2f})")
-                return trend_4h, score_4h * 0.85
+                best_trend, best_score = trend_1h, score_1h * 0.75
+            if score_4h > best_score and score_4h > 0.4 and trend_4h != TrendEnum.NEUTRAL:
+                best_trend, best_score = trend_4h, score_4h * 0.75
 
-            logger.debug("No clear trend direction")
+            if best_trend != TrendEnum.NEUTRAL:
+                logger.info(f"[TREND] Single TF fallback → {best_trend} ({best_score:.2f})")
+                return best_trend, best_score
+
+            logger.info("[TREND] No clear structure on 1H/4H → NEUTRAL")
             return TrendEnum.NEUTRAL, 0.0
 
         except Exception as e:
-            logger.error(f"Error in trend analysis: {str(e)}")
+            logger.error(f"Error in trend analysis: {e}")
             return TrendEnum.NEUTRAL, 0.0
 
-    def _detect_trend_direction(self, df: pd.DataFrame) -> Tuple[TrendEnum, float]:
-        """Detect trend from a single timeframe's candle data using HH/HL/LH/LL counting."""
-        if len(df) < 3:
-            return TrendEnum.NEUTRAL, 0.0
+    # ─── S/R Level Identification ────────────────────────────────────────────
 
-        higher_highs = higher_lows = lower_highs = lower_lows = 0
-
-        for i in range(1, len(df)):
-            if df.iloc[i]['high'] > df.iloc[i-1]['high']:
-                higher_highs += 1
-            if df.iloc[i]['low'] > df.iloc[i-1]['low']:
-                higher_lows += 1
-            if df.iloc[i]['high'] < df.iloc[i-1]['high']:
-                lower_highs += 1
-            if df.iloc[i]['low'] < df.iloc[i-1]['low']:
-                lower_lows += 1
-
-        total = len(df) - 1
-        if total == 0:
-            return TrendEnum.NEUTRAL, 0.0
-
-        up_score = (higher_highs + higher_lows) / (total * 2)
-        down_score = (lower_highs + lower_lows) / (total * 2)
-
-        if up_score > 0.45:
-            return TrendEnum.UP, up_score
-        if down_score > 0.45:
-            return TrendEnum.DOWN, down_score
-
-        return TrendEnum.NEUTRAL, 0.0
-
-    async def _find_levels(self) -> Tuple[Optional[float], Optional[float]]:
-        """Level 2: Identify support and resistance from 15M swing points."""
+    async def _find_levels(self, df_15m: pd.DataFrame, current_price: float) -> Tuple[Optional[float], Optional[float]]:
         try:
-            candles = await self.tv_client.get_candles('15m', 40)
-            if not candles or len(candles) < 5:
+            swing_highs = self._find_swing_highs(df_15m, n=LEVELS_LOOKBACK)
+            swing_lows = self._find_swing_lows(df_15m, n=LEVELS_LOOKBACK)
+
+            if len(swing_highs) < 2 or len(swing_lows) < 2:
+                logger.info("[LEVELS] Insufficient swing points for S/R")
                 return None, None
 
-            df = pd.DataFrame([c.model_dump() for c in candles])
-            current_price = df.iloc[-1]['close']
+            high_prices = sorted([df_15m['high'].iloc[i] for i in swing_highs])
+            low_prices = sorted([df_15m['low'].iloc[i] for i in swing_lows])
 
-            # Find swing lows (support)
-            support_levels = []
-            for i in range(1, len(df) - 1):
-                if df.iloc[i]['low'] < df.iloc[i-1]['low'] and df.iloc[i]['low'] < df.iloc[i+1]['low']:
-                    support_levels.append(df.iloc[i]['low'])
+            cluster_threshold = current_price * 0.0015
 
-            # Find swing highs (resistance)
-            resistance_levels = []
-            for i in range(1, len(df) - 1):
-                if df.iloc[i]['high'] > df.iloc[i-1]['high'] and df.iloc[i]['high'] > df.iloc[i+1]['high']:
-                    resistance_levels.append(df.iloc[i]['high'])
+            def cluster(prices: List[float]) -> List[float]:
+                if not prices:
+                    return []
+                clustered = []
+                group = [prices[0]]
+                for p in prices[1:]:
+                    if abs(p - group[-1]) <= cluster_threshold:
+                        group.append(p)
+                    else:
+                        clustered.append(round(sum(group) / len(group), 2))
+                        group = [p]
+                clustered.append(round(sum(group) / len(group), 2))
+                return clustered
 
-            # Get nearest level below (support) and above (resistance) current price
-            support = self._find_nearest_level(support_levels, current_price, below=True) if support_levels else df['low'].min()
-            resistance = self._find_nearest_level(resistance_levels, current_price, below=False) if resistance_levels else df['high'].max()
+            clustered_highs = cluster(high_prices)
+            clustered_lows = cluster(low_prices)
 
-            logger.debug(f"Levels - S: {support:.2f}, R: {resistance:.2f} @ ${current_price:.2f}")
+            resistance_candidates = [h for h in clustered_highs if h > current_price]
+            support_candidates = [l for l in clustered_lows if l < current_price]
+
+            if not resistance_candidates or not support_candidates:
+                logger.info("[LEVELS] No valid levels above/below current price")
+                return None, None
+
+            resistance = min(resistance_candidates)
+            support = max(support_candidates)
+
+            level_range = resistance - support
+            min_range = current_price * 0.003
+
+            if level_range < min_range:
+                logger.info(f"[LEVELS] Range ${level_range:.2f} too tight (min ${min_range:.2f})")
+                return None, None
+
+            logger.info(f"[LEVELS] Support: {support} | Resistance: {resistance} | Range: ${level_range:.2f}")
             return support, resistance
 
         except Exception as e:
-            logger.error(f"Error finding levels: {str(e)}")
+            logger.error(f"Error finding levels: {e}")
             return None, None
 
-    def _find_nearest_level(self, levels: List[float], price: float, below: bool = True) -> float:
-        """Find nearest level below (support) or above (resistance) current price."""
-        if not levels:
-            return round(price * (0.99 if below else 1.01), 2)
-        if below:
-            candidates = [l for l in levels if l <= price]
-            return max(candidates) if candidates else max(levels)
+    # ─── Mr. PFX Component Scoring ──────────────────────────────────────────
+
+    async def _score_mrpfx_components(
+        self, df_15m: pd.DataFrame, df_1h: pd.DataFrame,
+        trend: TrendEnum, support: float, resistance: float
+    ) -> Dict[str, float]:
+        scores = {}
+        current_price = df_15m['close'].iloc[-1]
+        atr_15m = self._calculate_atr(df_15m, 10)
+
+        # Component 1: Levels of Rejection
+        rejection_score = 0.0
+        last_5 = df_15m.tail(5)
+        for _, candle in last_5.iterrows():
+            if trend == TrendEnum.UP:
+                low = candle['low']
+                if low <= support:
+                    body_top = max(candle['open'], candle['close'])
+                    if body_top > support:
+                        rejection_score = max(rejection_score, 1.0)
+                    elif abs(low - support) <= current_price * 0.002:
+                        rejection_score = max(rejection_score, 0.5)
+                    else:
+                        rejection_score = max(rejection_score, 0.0)
+            else:
+                high = candle['high']
+                if high >= resistance:
+                    body_bottom = min(candle['open'], candle['close'])
+                    if body_bottom < resistance:
+                        rejection_score = max(rejection_score, 1.0)
+                    elif abs(high - resistance) <= current_price * 0.002:
+                        rejection_score = max(rejection_score, 0.5)
+                    else:
+                        rejection_score = max(rejection_score, 0.0)
+        scores['rejection'] = rejection_score
+
+        # Component 2: Internal Regions (consolidation)
+        consol_score = 0.0
+        atr_threshold = atr_15m * 0.4
+        consol_count = 0
+        for _, candle in df_15m.tail(10).iterrows():
+            if (candle['high'] - candle['low']) < atr_threshold:
+                consol_count += 1
+            else:
+                if consol_count >= 3:
+                    break
+                consol_count = 0
+        if consol_count >= 3:
+            consol_score = 1.0
+        elif consol_count >= 2:
+            consol_score = 0.5
+        scores['internal_region'] = consol_score
+
+        # Component 3: Build-up of Structure
+        structure_score = 0.0
+        sh_1h = self._find_swing_highs(df_1h)
+        sl_1h = self._find_swing_lows(df_1h)
+        if trend == TrendEnum.UP:
+            ascending = sum(1 for i in range(1, len(sh_1h)) if df_1h['high'].iloc[sh_1h[i]] > df_1h['high'].iloc[sh_1h[i-1]])
+            if ascending >= 3:
+                structure_score = 1.0
+            elif ascending >= 2:
+                structure_score = 0.5
         else:
-            candidates = [l for l in levels if l >= price]
-            return min(candidates) if candidates else min(levels)
+            descending = sum(1 for i in range(1, len(sh_1h)) if df_1h['high'].iloc[sh_1h[i]] < df_1h['high'].iloc[sh_1h[i-1]])
+            if descending >= 3:
+                structure_score = 1.0
+            elif descending >= 2:
+                structure_score = 0.5
+        scores['structure'] = structure_score
 
-    async def _detect_pullback(self, support: float, resistance: float, trend: TrendEnum) -> bool:
-        """Level 3: Check if price is near a key level using percentage-based zone.
+        # Component 4: S/R with Directional Bias
+        bias_ratio = (current_price - support) / (resistance - support) if (resistance - support) > 0 else 0.5
+        if trend == TrendEnum.UP:
+            if bias_ratio < 0.35:
+                sr_bias_score = 1.0
+            elif bias_ratio < 0.5:
+                sr_bias_score = 0.5
+            else:
+                sr_bias_score = 0.0
+        else:
+            if bias_ratio > 0.65:
+                sr_bias_score = 1.0
+            elif bias_ratio > 0.5:
+                sr_bias_score = 0.5
+            else:
+                sr_bias_score = 0.0
+        scores['sr_bias'] = sr_bias_score
 
-        Uses a dynamic zone of 0.5% of price (~$20 at $4,073) since fixed pip
-        values don't scale well for XAU/USD at current prices.
-        """
+        # Component 5: Standard Breakout
+        breakout_score = 0.0
+        all_sh = sorted(self._find_swing_highs(df_15m))
+        all_sl = sorted(self._find_swing_lows(df_15m))
+        for _, candle in df_15m.tail(5).iterrows():
+            close = candle['close']
+            for idx in all_sh:
+                level = df_15m['high'].iloc[idx]
+                if close > level:
+                    for _, later in df_15m.tail(3).iterrows():
+                        if abs(later['close'] - level) <= current_price * 0.002:
+                            breakout_score = max(breakout_score, 1.0)
+                            break
+                    else:
+                        breakout_score = max(breakout_score, 0.5)
+            for idx in all_sl:
+                level = df_15m['low'].iloc[idx]
+                if close < level:
+                    for _, later in df_15m.tail(3).iterrows():
+                        if abs(later['close'] - level) <= current_price * 0.002:
+                            breakout_score = max(breakout_score, 1.0)
+                            break
+                    else:
+                        breakout_score = max(breakout_score, 0.5)
+        scores['breakout'] = breakout_score
+
+        # Component 6: BOB Confirmation
+        bob_score = 0.0
+        avg_body = abs(df_15m['close'] - df_15m['open']).tail(10).mean()
+        threshold_body = avg_body * 1.5
+        significant_candles = []
+        for i, (_, candle) in enumerate(df_15m.tail(20).iterrows()):
+            body = abs(candle['close'] - candle['open'])
+            if body > threshold_body:
+                significant_candles.append(i)
+        for idx in significant_candles:
+            if idx + 1 < len(df_15m):
+                sig_candle = df_15m.iloc[idx]
+                next_candle = df_15m.iloc[idx + 1]
+                block_high = max(sig_candle['open'], sig_candle['close'])
+                block_low = min(sig_candle['open'], sig_candle['close'])
+                if trend == TrendEnum.UP and next_candle['close'] > block_high:
+                    bob_score = 1.0
+                    break
+                elif trend == TrendEnum.DOWN and next_candle['close'] < block_low:
+                    bob_score = 1.0
+                    break
+        if bob_score == 0.0 and significant_candles:
+            bob_score = 0.5
+        scores['bob'] = bob_score
+
+        return scores
+
+    def _calculate_weighted_score(self, scores: Dict[str, float]) -> float:
+        return sum(scores[comp] * WEIGHTS[i] for i, comp in enumerate(COMPONENTS))
+
+    # ─── Pullback Detection ──────────────────────────────────────────────────
+
+    async def _detect_pullback(
+        self, df_5m: pd.DataFrame, support: float, resistance: float, trend: TrendEnum
+    ) -> Tuple[bool, float]:
         try:
-            candles = await self.tv_client.get_candles('5m', 20)
-            if not candles:
-                return False
-
-            df = pd.DataFrame([c.model_dump() for c in candles])
-            current_price = df.iloc[-1]['close']
-
-            # Percentage-based zone: 0.5% of current price
-            pullback_zone = current_price * 0.005  # ~$20 for XAU at $4,073
+            current_price = df_5m['close'].iloc[-1]
+            atr_5m = self._calculate_atr(df_5m, 14)
+            pullback_zone = atr_5m * 1.5
 
             if trend == TrendEnum.UP:
-                within_zone = abs(current_price - support) <= pullback_zone
-                if within_zone:
-                    volatility = self._calculate_volatility(df)
-                    logger.debug(f"UPTREND pullback: price={current_price:.2f}, support={support:.2f}, "
-                               f"zone={pullback_zone:.2f}, vol={volatility:.4f}")
-                    return True  # Always accept if within zone; volatility check is informative
+                if support < current_price <= support + pullback_zone:
+                    logger.info(f"[PULLBACK] ATR-14(5M): ${atr_5m:.2f} | Zone: ${pullback_zone:.2f} | "
+                               f"Price: {current_price:.2f} | Dist to support: ${current_price - support:.2f} ✓")
+                    return True, atr_5m
+                elif current_price <= support:
+                    logger.info(f"[PULLBACK] Price {current_price:.2f} below support {support:.2f} — breakdown, not pullback")
+                    return False, atr_5m
+                else:
+                    logger.info(f"[PULLBACK] Price {current_price:.2f} above pullback zone (support+zone=${support + pullback_zone:.2f})")
+                    return False, atr_5m
 
-            elif trend == TrendEnum.DOWN:
-                within_zone = abs(current_price - resistance) <= pullback_zone
-                if within_zone:
-                    volatility = self._calculate_volatility(df)
-                    logger.debug(f"DOWNTREND pullback: price={current_price:.2f}, resistance={resistance:.2f}, "
-                               f"zone={pullback_zone:.2f}, vol={volatility:.4f}")
-                    return True
-
-            # If price is near the opposite level, still consider it a pullback
-            if trend == TrendEnum.UP and abs(current_price - resistance) <= pullback_zone * 0.5:
-                logger.debug(f"Price near resistance in uptrend — potential breakout")
-                return True
-            if trend == TrendEnum.DOWN and abs(current_price - support) <= pullback_zone * 0.5:
-                logger.debug(f"Price near support in downtrend — potential breakdown")
-                return True
-
-            return False
+            else:
+                if resistance - pullback_zone <= current_price < resistance:
+                    logger.info(f"[PULLBACK] ATR-14(5M): ${atr_5m:.2f} | Zone: ${pullback_zone:.2f} | "
+                               f"Price: {current_price:.2f} | Dist to resistance: ${resistance - current_price:.2f} ✓")
+                    return True, atr_5m
+                elif current_price >= resistance:
+                    logger.info(f"[PULLBACK] Price {current_price:.2f} above resistance {resistance:.2f} — breakout, not pullback")
+                    return False, atr_5m
+                else:
+                    logger.info(f"[PULLBACK] Price {current_price:.2f} below pullback zone (resistance-zone=${resistance - pullback_zone:.2f})")
+                    return False, atr_5m
 
         except Exception as e:
-            logger.error(f"Error detecting pullback: {str(e)}")
-            return False
+            logger.error(f"Error detecting pullback: {e}")
+            return False, 0.0
 
-    def _calculate_volatility(self, df: pd.DataFrame) -> float:
-        """Calculate normalized ATR-style volatility from candle data."""
-        df_range = df['high'] - df['low']
-        avg_range = df_range.mean()
-        avg_close = df['close'].mean()
-        return avg_range / avg_close if avg_close > 0 else 0
+    # ─── Entry Confirmation ──────────────────────────────────────────────────
 
-    async def _confirm_entry(self, support: float, resistance: float, trend: TrendEnum) -> Tuple[Optional[float], bool]:
-        """Level 4: Confirm entry point on 1M candles.
-
-        Looks for reversal candles or trend-aligned price action.
-        Falls back gracefully when pattern detection doesn't trigger.
-        """
+    async def _confirm_entry(
+        self, df_1m: pd.DataFrame, support: float, resistance: float, trend: TrendEnum, atr_5m: float
+    ) -> Tuple[Optional[float], bool]:
         try:
-            candles = await self.tv_client.get_candles('1m', 15)
-            if not candles or len(candles) < 3:
+            if len(df_1m) < 5:
                 return None, False
 
-            df = pd.DataFrame([c.model_dump() for c in candles])
-            current_candle = df.iloc[-1]
+            current_candle = df_1m.iloc[-1]
+            entry_price = round(current_candle['close'], 2)
 
-            is_reversal = self._detect_reversal_candle(df)
-            if is_reversal:
-                logger.debug("Reversal candle detected — entry confirmed")
-                if trend == TrendEnum.UP:
-                    return round(current_candle['close'] - 0.01, 2), True
-                else:
-                    return round(current_candle['close'] + 0.01, 2), True
+            # Primary: Reversal candle
+            pattern = self._detect_reversal_candle(df_1m, trend)
+            if pattern:
+                logger.info(f"[ENTRY] Pattern: {pattern} | Entry: {entry_price} ✓")
+                return entry_price, True
 
-            # Trend alignment fallback: last 3 candles moving in trend direction
-            last_three = df.tail(3)
-            if trend == TrendEnum.UP and last_three['close'].iloc[-1] > last_three['close'].iloc[0]:
-                logger.debug("Trend alignment confirmed for UPTREND")
-                return round(current_candle['close'], 2), True
-            if trend == TrendEnum.DOWN and last_three['close'].iloc[-1] < last_three['close'].iloc[0]:
-                logger.debug("Trend alignment confirmed for DOWNTREND")
-                return round(current_candle['close'], 2), True
+            # Secondary: Structure break on 1M
+            sh_1m = self._find_swing_highs(df_1m, n=1)
+            sl_1m = self._find_swing_lows(df_1m, n=1)
+            if trend == TrendEnum.UP and len(sl_1m) >= 1:
+                last_swing_low = df_1m['low'].iloc[sl_1m[-1]]
+                if current_candle['close'] > last_swing_low and \
+                   any(df_1m['close'].iloc[i] > last_swing_low for i in range(-4, -1)):
+                    logger.info(f"[ENTRY] Structure break UP — broke swing low {last_swing_low:.2f} | Entry: {entry_price} ✓")
+                    return entry_price, True
+            elif trend == TrendEnum.DOWN and len(sh_1m) >= 1:
+                last_swing_high = df_1m['high'].iloc[sh_1m[-1]]
+                if current_candle['close'] < last_swing_high and \
+                   any(df_1m['close'].iloc[i] < last_swing_high for i in range(-4, -1)):
+                    logger.info(f"[ENTRY] Structure break DOWN — broke swing high {last_swing_high:.2f} | Entry: {entry_price} ✓")
+                    return entry_price, True
 
-            # Simple price-in-trend-direction fallback
-            if trend == TrendEnum.UP and current_candle['close'] > current_candle['open']:
-                logger.debug("Green candle in uptrend — accepting as entry")
-                return round(current_candle['close'], 2), True
-            if trend == TrendEnum.DOWN and current_candle['close'] < current_candle['open']:
-                logger.debug("Red candle in downtrend — accepting as entry")
-                return round(current_candle['close'], 2), True
+            # Tertiary: Momentum confirmation
+            atr_1m = self._calculate_atr(df_1m, 14)
+            min_body = atr_1m * 0.3
+            last_3 = df_1m.tail(3)
+            if trend == TrendEnum.UP:
+                if all(last_3['close'].iloc[i] > last_3['close'].iloc[i-1] for i in range(1, 3)):
+                    if all(abs(c['close'] - c['open']) >= min_body for _, c in last_3.iterrows()):
+                        logger.info(f"[ENTRY] Momentum UP — 3 rising closes | Entry: {entry_price} ✓")
+                        return entry_price, True
+            else:
+                if all(last_3['close'].iloc[i] < last_3['close'].iloc[i-1] for i in range(1, 3)):
+                    if all(abs(c['close'] - c['open']) >= min_body for _, c in last_3.iterrows()):
+                        logger.info(f"[ENTRY] Momentum DOWN — 3 falling closes | Entry: {entry_price} ✓")
+                        return entry_price, True
 
-            logger.debug("No entry confirmation on 1M")
+            logger.info("[ENTRY] No confirmation pattern found on 1M ✗")
             return None, False
 
         except Exception as e:
-            logger.error(f"Error confirming entry: {str(e)}")
+            logger.error(f"Error confirming entry: {e}")
             return None, False
 
-    def _detect_reversal_candle(self, df: pd.DataFrame) -> bool:
-        """Detect reversal candle patterns: pin bar or engulfing."""
-        if len(df) < 2:
-            return False
+    def _detect_reversal_candle(self, df: pd.DataFrame, trend: TrendEnum) -> Optional[str]:
+        if len(df) < 3:
+            return None
 
         current = df.iloc[-1]
-        previous = df.iloc[-2]
-
-        body_range = abs(current['close'] - current['open'])
+        prev = df.iloc[-2]
+        body = abs(current['close'] - current['open'])
         total_range = current['high'] - current['low']
 
         if total_range == 0:
-            return False
+            return None
 
-        # Pin bar: small body + long wick
-        if body_range < total_range * 0.3:
-            wick_range = max(
-                current['high'] - max(current['open'], current['close']),
-                min(current['open'], current['close']) - current['low']
-            )
-            if wick_range > total_range * 0.5:
-                return True
+        atr = self._calculate_atr(df, 10)
+        min_body = atr * 0.5
 
-        # Engulfing pattern
-        prev_body_range = abs(previous['close'] - previous['open'])
-        if prev_body_range > 0:
-            if (current['open'] < previous['close'] and current['close'] > previous['open']):
-                return True
-            if (current['open'] > previous['close'] and current['close'] < previous['open']):
-                return True
+        # Pin bar
+        body_ratio = body / total_range
+        if body_ratio < 0.25:
+            upper_wick = current['high'] - max(current['open'], current['close'])
+            lower_wick = min(current['open'], current['close']) - current['low']
+            if trend == TrendEnum.UP and lower_wick > total_range * 0.6:
+                return 'bullish_pin_bar'
+            elif trend == TrendEnum.DOWN and upper_wick > total_range * 0.6:
+                return 'bearish_pin_bar'
+            elif lower_wick > total_range * 0.6 and upper_wick > total_range * 0.6:
+                return 'doji'
 
-        return False
+        # Engulfing
+        prev_body = abs(prev['close'] - prev['open'])
+        if prev_body >= min_body and body >= min_body:
+            if trend == TrendEnum.UP:
+                if current['close'] > prev['open'] and current['open'] < prev['close'] and \
+                   current['close'] > prev['high']:
+                    return 'bullish_engulfing'
+            else:
+                if current['close'] < prev['open'] and current['open'] > prev['close'] and \
+                   current['close'] < prev['low']:
+                    return 'bearish_engulfing'
 
-    def _build_signal(self, trend: TrendEnum, entry_price: float, support: float, resistance: float) -> Signal:
-        """Build final Signal with 4 stacked entries and take-profit levels.
+        # Morning/Evening star (3-candle pattern)
+        if len(df) >= 3:
+            c1 = df.iloc[-3]
+            c2 = df.iloc[-2]
+            c3 = current
+            if trend == TrendEnum.UP:
+                if c1['close'] < c1['open'] and abs(c3['close'] - c3['open']) >= min_body and \
+                   c3['close'] > c1['close'] and abs(c2['close'] - c2['open']) < atr * 0.3:
+                    return 'morning_star'
+            else:
+                if c1['close'] > c1['open'] and abs(c3['close'] - c3['open']) >= min_body and \
+                   c3['close'] < c1['close'] and abs(c2['close'] - c2['open']) < atr * 0.3:
+                    return 'evening_star'
 
-        Entry structure for UPTREND (inverted for DOWNTREND):
-        - Entry 1: entry_price, TP +20 pips ($0.20), AUTO CLOSE
-        - Entry 2: entry_price - 5 pips, TP +40 pips, Manual
-        - Entry 3: entry_price - 10 pips, TP +60 pips, Manual
-        - Entry 4: entry_price - 15 pips, TP +80 pips, Manual
-        """
+        return None
+
+    # ─── Signal Building ─────────────────────────────────────────────────────
+
+    def _build_signal(
+        self, trend: TrendEnum, entry_price: float,
+        support: float, resistance: float,
+        atr_5m: float, confidence: float
+    ) -> Signal:
+        s_range = abs(resistance - support)
+        entry_spacing = max(round(atr_5m * 2, 1), 5.0)
+
         entries = []
-        pip_value = 0.01  # XAU/USD standard pip at 2-decimal brokers
 
-        if trend == TrendEnum.DOWN:
-            tp_increments = [-20, -40, -60, -80]
-            entry_offsets = [0, 5, 10, 15]
+        if trend == TrendEnum.UP:
+            tp1 = round((entry_price + resistance) / 2, 2)
+            tp2 = round(resistance, 2)
+            tp3 = round(resistance + s_range * 0.5, 2)
+            tp4 = round(resistance + s_range, 2)
+
+            offsets = [0, -entry_spacing, -(entry_spacing * 2), -(entry_spacing * 3)]
+            tps = [tp1, tp2, tp3, tp4]
+            auto_closes = [True, False, False, False]
         else:
-            tp_increments = [20, 40, 60, 80]
-            entry_offsets = [0, -5, -10, -15]
+            tp1 = round((entry_price + support) / 2, 2)
+            tp2 = round(support, 2)
+            tp3 = round(support - s_range * 0.5, 2)
+            tp4 = round(support - s_range, 2)
 
-        for idx, (tp_pips, offset_pips) in enumerate(zip(tp_increments, entry_offsets)):
-            entry = entry_price + (offset_pips * pip_value)
-            tp = entry_price + (tp_pips * pip_value)
+            offsets = [0, entry_spacing, entry_spacing * 2, entry_spacing * 3]
+            tps = [tp1, tp2, tp3, tp4]
+            auto_closes = [True, False, False, False]
 
-            signal_entry = SignalEntry(
+        for idx in range(4):
+            price = round(entry_price + offsets[idx], 2)
+            tp = tps[idx]
+            tp_pips = int(abs(tp - price) / PIP_VALUE)
+
+            entries.append(SignalEntry(
                 entry_number=idx + 1,
-                price=round(entry, 2),
-                tp=round(tp, 2),
-                tp_pips=abs(tp_pips),
-                auto_close=(idx == 0)
-            )
-            entries.append(signal_entry)
+                price=price,
+                tp=tp,
+                tp_pips=tp_pips,
+                auto_close=auto_closes[idx],
+            ))
+
+        # Calculate stop loss
+        if trend == TrendEnum.UP:
+            sl_price = round(support - atr_5m * 0.5, 2)
+        else:
+            sl_price = round(resistance + atr_5m * 0.5, 2)
 
         now = datetime.utcnow()
         signal_id = f"signal_{now.strftime('%Y%m%d_%H%M%S')}"
@@ -355,7 +533,76 @@ class SignalGenerator:
             pullback_detected=True,
             entry_confirmation=True,
             valid_until=now + timedelta(hours=Config.SIGNAL_VALIDITY_HOURS),
-            confidence=0.75
+            confidence=round(confidence, 2),
         )
 
+        logger.info(f"[SIGNAL] ID: {signal_id} | Entries: {[e.price for e in entries]} | "
+                   f"TPs: {[e.tp for e in entries]} | SL: ~{sl_price} | Confidence: {confidence:.2f}")
+
         return signal
+
+    # ─── Main Entry Point ────────────────────────────────────────────────────
+
+    async def generate_signal(self) -> Tuple[Optional[Signal], str]:
+        try:
+            candles_1h = await self.tv_client.get_candles('1h', 20)
+            candles_4h = await self.tv_client.get_candles('4h', 15)
+            candles_15m = await self.tv_client.get_candles('15m', 60)
+            candles_5m = await self.tv_client.get_candles('5m', 30)
+            candles_1m = await self.tv_client.get_candles('1m', 20)
+
+            if not all([candles_1h, candles_4h, candles_15m, candles_5m, candles_1m]):
+                return None, "Failed to fetch market data for one or more timeframes."
+
+            df_1h = pd.DataFrame([c.model_dump() for c in candles_1h])
+            df_4h = pd.DataFrame([c.model_dump() for c in candles_4h])
+            df_15m = pd.DataFrame([c.model_dump() for c in candles_15m])
+            df_5m = pd.DataFrame([c.model_dump() for c in candles_5m])
+            df_1m = pd.DataFrame([c.model_dump() for c in candles_1m])
+
+            current_price = df_1m['close'].iloc[-1]
+
+            # Stage 1 — Trend
+            trend, trend_confidence = await self._analyze_trend(df_1h, df_4h)
+            if trend == TrendEnum.NEUTRAL:
+                return None, "No clear market structure on 1H/4H. No signal."
+
+            # Stage 2 — S/R Levels
+            support, resistance = await self._find_levels(df_15m, current_price)
+            if not support or not resistance:
+                return None, "No valid S/R levels found on 15M. No signal."
+
+            # Stage 3 — Mr. PFX Scoring
+            component_scores = await self._score_mrpfx_components(df_15m, df_1h, trend, support, resistance)
+            weighted_score = self._calculate_weighted_score(component_scores)
+            score_str = " | ".join(f"{k}={v:.2f}" for k, v in component_scores.items())
+            logger.info(f"[MRPFX] {score_str}")
+            logger.info(f"[MRPFX] Weighted score: {weighted_score:.2f} (threshold: {SIGNAL_THRESHOLD}) {'✓' if weighted_score >= SIGNAL_THRESHOLD else '✗'}")
+            if weighted_score < SIGNAL_THRESHOLD:
+                return None, f"Mr. PFX score {weighted_score:.2f} below threshold ({SIGNAL_THRESHOLD}). No signal."
+
+            # Stage 4 — Pullback
+            pullback_detected, atr_5m = await self._detect_pullback(df_5m, support, resistance, trend)
+            if not pullback_detected:
+                return None, "No valid pullback to key level on 5M. No signal."
+
+            # Stage 5 — Entry Confirmation
+            entry_price, entry_confirmed = await self._confirm_entry(df_1m, support, resistance, trend, atr_5m)
+            if not entry_confirmed:
+                return None, "No entry confirmation pattern on 1M. No signal."
+
+            signal = self._build_signal(
+                trend=trend,
+                entry_price=entry_price,
+                support=support,
+                resistance=resistance,
+                atr_5m=atr_5m,
+                confidence=weighted_score,
+            )
+
+            logger.info(f"[SIGNAL] Generated: {signal.id} | Confidence: {weighted_score:.2f}")
+            return signal, "Signal generated successfully."
+
+        except Exception as e:
+            logger.error(f"Error generating signal: {e}")
+            return None, f"Error: {e}"
